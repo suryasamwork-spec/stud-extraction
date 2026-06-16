@@ -1,0 +1,406 @@
+"""
+extractor.py  —  Stud Extraction engine
+
+Pipeline per page:
+  image / PDF page
+  -> render to grayscale (RENDER_SCALE)
+  -> OCR in 3 orientations (0°, 90°CW, 90°CCW) to catch rotated labels
+  -> for each detected beam token, read stud from adjacent tokens
+  -> for beams still missing a stud, zoom into the CORRECT rotated image
+     and re-OCR that region (angle-aware so the bracket is always "to the right")
+  -> de-duplicate by location
+  -> ONLY keep beams that have a confirmed stud value
+  -> normalise coordinates to 0-1 range for frontend
+"""
+
+import io
+import os
+import re
+import winreg
+
+import pytesseract
+from PIL import Image, ImageOps
+import pypdfium2 as pdfium
+
+
+# ---------------------------------------------------------------------------
+# Locate Tesseract
+# ---------------------------------------------------------------------------
+def _find_tesseract() -> str | None:
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(hive, r"SOFTWARE\Tesseract-OCR") as k:
+                path, _ = winreg.QueryValueEx(k, "InstallDir")
+                exe = os.path.join(path, "tesseract.exe")
+                if os.path.isfile(exe):
+                    return exe
+        except OSError:
+            pass
+    for c in [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+    ]:
+        if os.path.isfile(c):
+            return c
+    from shutil import which
+    return which("tesseract")
+
+
+_TESS = _find_tesseract()
+if _TESS:
+    pytesseract.pytesseract.tesseract_cmd = _TESS
+
+
+def tesseract_status() -> dict:
+    if not _TESS:
+        return {"available": False, "path": None, "version": None}
+    try:
+        ver = str(pytesseract.get_tesseract_version())
+    except Exception:
+        ver = "unknown"
+    return {"available": True, "path": _TESS, "version": ver}
+
+
+# ---------------------------------------------------------------------------
+# Tuning constants
+# ---------------------------------------------------------------------------
+RENDER_SCALE  = 2       # ~144 DPI — enough for OCR, keeps images manageable
+MIN_IMG_PX    = 3000    # upscale small plain images to at least this
+STUD_MIN      = 4
+STUD_MAX      = 99
+DEDUP_RADIUS  = 45      # px in original-image space
+
+# Beam section must have at least 2 digits in weight to avoid corrupted matches
+BEAM_RE = re.compile(r"W(\d{2,3})[xX](\d{2,3})")
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+def _load_pages(data: bytes, filename: str) -> list[Image.Image]:
+    name = (filename or "").lower()
+    if name.endswith(".pdf") or data[:5] == b"%PDF-":
+        pdf = pdfium.PdfDocument(data)
+        pages = []
+        try:
+            for i in range(len(pdf)):
+                img = pdf[i].render(scale=RENDER_SCALE).to_pil().convert("L")
+                pages.append(ImageOps.autocontrast(img))
+        finally:
+            pdf.close()
+        return pages
+
+    img = Image.open(io.BytesIO(data)).convert("L")
+    longest = max(img.size)
+    if longest < MIN_IMG_PX:
+        f = MIN_IMG_PX / longest
+        img = img.resize((int(img.width * f), int(img.height * f)), Image.LANCZOS)
+    return [ImageOps.autocontrast(img)]
+
+
+# ---------------------------------------------------------------------------
+# Stud parsing
+# ---------------------------------------------------------------------------
+def _parse_stud(text: str) -> int | None:
+    """
+    Extract stud value ONLY if bracketed with BOTH opening and closing brackets.
+    Reject incomplete or stray numbers to avoid false positives.
+    """
+    s = text.replace(" ", "")
+
+    # Must have BOTH opening and closing brackets (strict matching)
+    patterns = [
+        r"\[(\d{1,3})\]",      # [24]
+        r"\((\d{1,3})\)",      # (38)
+        r"\{(\d{1,3})\}",      # {20}
+        r"<(\d{1,3})>",        # <16>
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, s)
+        if m:
+            v = int(m.group(1))
+            if STUD_MIN <= v <= STUD_MAX:
+                return v
+
+    return None
+
+
+def _filter_outliers(detections: list[dict]) -> list[dict]:
+    """
+    Remove isolated beams from title blocks, legends, and margins.
+    Keep the main cluster (structural plan) by filtering outliers.
+    """
+    if len(detections) < 6:
+        return detections
+
+    # Calculate center of mass
+    cx_mean = sum(d["cx"] for d in detections) / len(detections)
+    cy_mean = sum(d["cy"] for d in detections) / len(detections)
+
+    # Calculate distances from center
+    distances = [
+        ((d["cx"] - cx_mean) ** 2 + (d["cy"] - cy_mean) ** 2) ** 0.5
+        for d in detections
+    ]
+
+    # Remove the farthest outliers (those >1.5× median distance)
+    sorted_dists = sorted(distances)
+    median_dist = sorted_dists[len(sorted_dists) // 2]
+    threshold = median_dist * 1.5
+
+    filtered = [d for d, dist in zip(detections, distances) if dist <= threshold]
+
+    return filtered if filtered else detections  # Fallback if too many removed
+
+
+def _zoom_read(img: Image.Image, x, y, w, h) -> int | None:
+    """Re-OCR a zoomed crop of the label row to pick up the bracket."""
+    iw, ih = img.size
+    # Include area to the right (where bracket lives) but generous on all sides
+    rx0 = max(0,  int(x - w * 0.2))
+    rx1 = min(iw, int(x + w * 5.0))
+    ry0 = max(0,  int(y - h * 0.6))
+    ry1 = min(ih, int(y + h + h * 0.6))
+    crop = img.crop((rx0, ry0, rx1, ry1))
+    if crop.width < 4 or crop.height < 4:
+        return None
+    crop = crop.resize((crop.width * 3, crop.height * 3), Image.LANCZOS)
+    txt = pytesseract.image_to_string(crop, config="--oem 3 --psm 7")
+    return _parse_stud(txt)
+
+
+def _re_ocr_rotated(rotated_img: Image.Image, rot_x: int, rot_y: int, rot_w: int, rot_h: int, angle: int) -> int | None:
+    """
+    For beams detected in rotated images (90°, 270°), extract the region,
+    rotate it back to upright, and re-OCR it for better stud accuracy.
+    """
+    if angle == 0:
+        return None  # Already upright
+
+    # Crop from rotated image
+    iw, ih = rotated_img.size
+    crop_x0 = max(0, int(rot_x - rot_w * 0.5))
+    crop_x1 = min(iw, int(rot_x + rot_w * 5.0))
+    crop_y0 = max(0, int(rot_y - rot_h * 0.5))
+    crop_y1 = min(ih, int(rot_y + rot_h * 1.5))
+    crop = rotated_img.crop((crop_x0, crop_y0, crop_x1, crop_y1))
+    if crop.width < 4 or crop.height < 4:
+        return None
+
+    # Rotate back to upright (undo the 90° or 270° rotation)
+    if angle == 90:
+        crop = crop.rotate(-90, expand=False)
+    elif angle == 270:
+        crop = crop.rotate(90, expand=False)
+
+    # Upscale and re-OCR
+    crop = crop.resize((crop.width * 3, crop.height * 3), Image.LANCZOS)
+    txt = pytesseract.image_to_string(crop, config="--oem 3 --psm 7")
+    return _parse_stud(txt)
+
+
+# ---------------------------------------------------------------------------
+# Scan one orientation — returns detections with rotated-image coordinates
+# ---------------------------------------------------------------------------
+def _scan_orientation(img: Image.Image, angle: int, orig_w: int, orig_h: int):
+    data = pytesseract.image_to_data(
+        img, config="--oem 3 --psm 11", output_type=pytesseract.Output.DICT
+    )
+    found = []
+    n = len(data["text"])
+    for i in range(n):
+        token = data["text"][i].replace(" ", "").strip()
+        m = BEAM_RE.match(token)
+        if not m:
+            continue
+        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        if w <= 0 or h <= 0:
+            continue
+
+        section = f"W{int(m.group(1))}X{int(m.group(2))}"
+
+        # Fast path: stud in same token
+        stud = _parse_stud(data["text"][i])
+
+        # If not found, look in adjacent tokens (same line or next line, horizontally close)
+        if stud is None:
+            for j in range(i + 1, min(i + 8, n)):
+                next_tok = data["text"][j]
+                next_x = data["left"][j]
+                # Check if vertically close (same line or next line) AND horizontally close
+                vert_close = abs(data["top"][j] - y) < h * 2.0
+                horiz_close = abs(next_x - (x + w)) < w * 3.0  # within 3× beam width to the right
+
+                if vert_close and horiz_close:
+                    # Try combining: "W18X40 [24]" or "W18X40\n[24]"
+                    combined = data["text"][i] + " " + next_tok
+                    stud = _parse_stud(combined)
+                    if stud is not None:
+                        break
+                    # Also try just the next token alone
+                    stud = _parse_stud(next_tok)
+                    if stud is not None:
+                        break
+
+        # Map centre back to original-image coordinates for deduplication
+        rcx, rcy = x + w / 2, y + h / 2
+        if angle == 0:
+            cx, cy = rcx, rcy
+        elif angle == 90:
+            cx, cy = orig_w - 1 - rcy, rcx
+        else:                      # 270
+            cx, cy = rcy, orig_h - 1 - rcx
+
+        found.append({
+            "cx": cx, "cy": cy,
+            "section": section,
+            "stud": stud,
+            # Keep rotated-image coordinates + angle for re-OCR on upright version
+            "rot_x": x, "rot_y": y, "rot_w": w, "rot_h": h,
+            "angle": angle,
+        })
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Full detection pipeline for one page
+# ---------------------------------------------------------------------------
+def _detect_all(gray: Image.Image) -> list[dict]:
+    ow, oh = gray.size
+
+    # Pre-rotate once; reuse for zoom fallback
+    rot90  = gray.rotate(90,  expand=True)
+    rot270 = gray.rotate(270, expand=True)
+    rot_imgs = {0: gray, 90: rot90, 270: rot270}
+
+    detections = (
+        _scan_orientation(gray,   0,   ow, oh)
+        + _scan_orientation(rot90,  90,  ow, oh)
+        + _scan_orientation(rot270, 270, ow, oh)
+    )
+
+    # De-duplicate — prefer 0° (original) over rotated, then prefer ones with studs
+    detections.sort(key=lambda d: (d["angle"] != 0, d["stud"] is None))
+    kept: list[dict] = []
+    for d in detections:
+        if not any(
+            abs(d["cx"] - k["cx"]) < DEDUP_RADIUS and abs(d["cy"] - k["cy"]) < DEDUP_RADIUS
+            for k in kept
+        ):
+            kept.append(d)
+
+    # For rotated detections, try re-OCR on the upright version for accuracy
+    for d in kept:
+        if d["angle"] != 0:
+            upright_stud = _re_ocr_rotated(
+                rot_imgs[d["angle"]],
+                d["rot_x"], d["rot_y"], d["rot_w"], d["rot_h"],
+                d["angle"]
+            )
+            if upright_stud is not None:
+                d["stud"] = upright_stud
+        # Fallback zoom if still missing
+        if d["stud"] is None:
+            d["stud"] = _zoom_read(
+                rot_imgs[d["angle"]],
+                d["rot_x"], d["rot_y"], d["rot_w"], d["rot_h"],
+            )
+
+    # *** Only keep beams with a confirmed stud value ***
+    kept = [d for d in kept if d["stud"] is not None]
+
+    # Sort: top-to-bottom, left-to-right
+    kept.sort(key=lambda d: (round(d["cy"] / 50), d["cx"]))
+
+    # Strip internal fields
+    for d in kept:
+        for k in ("rot_x", "rot_y", "rot_w", "rot_h", "angle"):
+            d.pop(k, None)
+
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+def build_summary(results: list[dict]) -> dict:
+    groups: dict[str, dict] = {}
+    total_studs = 0
+    for r in results:
+        g = groups.setdefault(
+            r["beam_section"],
+            {"section": r["beam_section"], "count": 0, "stud_total": 0, "instances": []},
+        )
+        g["count"] += 1
+        sv = r["stud_value"]
+        g["instances"].append(sv)
+        if isinstance(sv, int):
+            g["stud_total"] += sv
+            total_studs += sv
+
+    sections = sorted(groups.values(), key=lambda x: x["section"])
+    return {
+        "total_beams": len(results),
+        "total_studs": total_studs,
+        "total_sections": len(sections),
+        "sections": sections,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+def extract(data: bytes, filename: str) -> dict:
+    if not _TESS:
+        raise RuntimeError(
+            "Tesseract OCR not found. "
+            "Install from https://github.com/UB-Mannheim/tesseract/wiki"
+        )
+
+    pages = _load_pages(data, filename)
+    ocr_w, ocr_h = pages[0].size   # coordinate space for the first page
+
+    results = []
+    for page in pages:
+        pw, ph = page.size
+        for d in _detect_all(page):
+            results.append({
+                "beam_section": d["section"],
+                "stud_value":   d["stud"],
+                # Normalise to 0-1 so the frontend can map to any display size
+                "cx": round(d["cx"] / pw, 5),
+                "cy": round(d["cy"] / ph, 5),
+            })
+
+    return {
+        "filename":   filename,
+        "page_count": len(pages),
+        "ocr_width":  ocr_w,
+        "ocr_height": ocr_h,
+        "results":    results,
+        "summary":    build_summary(results),
+    }
+
+
+def render_preview(data: bytes, filename: str, max_px: int = 2000) -> bytes:
+    """Fast JPEG preview — low scale, independent of OCR resolution."""
+    name = (filename or "").lower()
+    if name.endswith(".pdf") or data[:5] == b"%PDF-":
+        pdf = pdfium.PdfDocument(data)
+        try:
+            img = pdf[0].render(scale=1.5).to_pil().convert("RGB")
+        finally:
+            pdf.close()
+    else:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+
+    longest = max(img.size)
+    if longest > max_px:
+        f = max_px / longest
+        img = img.resize((int(img.width * f), int(img.height * f)), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=82, optimize=True)
+    return buf.getvalue()
