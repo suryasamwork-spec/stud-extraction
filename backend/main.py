@@ -120,13 +120,9 @@ def init_db():
         cur = conn.execute("SELECT COUNT(*) FROM users")
         if cur.fetchone()[0] == 0:
             admin_pwd = hash_password("admin123")
-            lakshmi_pwd = hash_password("lakshmi123")
-            bala_pwd = hash_password("bala123")
-            knk_pwd = hash_password("knkmoorthy123")
+            user_pwd = hash_password("user123")
             conn.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", ("admin", admin_pwd, "admin"))
-            conn.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", ("lakshmiN", lakshmi_pwd, "user"))
-            conn.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", ("bala", bala_pwd, "user"))
-            conn.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", ("knkmoorthy", knk_pwd, "user"))
+            conn.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", ("user", user_pwd, "user"))
         conn.commit()
 
 
