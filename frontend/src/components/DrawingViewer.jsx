@@ -42,10 +42,17 @@ export default function DrawingViewer({
 
   const working = status === "working";
 
-  // ── Constrain a view so the drawing always covers the canvas ───────────────
-  // Scale can't drop below the fit scale (so zoom-out never reveals background),
-  // and pan offsets are clamped so the drawing edges can't move inside the
-  // viewport — the drawing "sticks" instead of floating over the grid.
+  const getMinScale = useCallback(() => {
+    const el = containerRef.current;
+    const { w, h } = sizeRef.current;
+    if (!el || !w || !h) return MIN_SCALE;
+    const fitScale = Math.min(el.clientWidth / w, el.clientHeight / h) * FIT_FILL;
+    return Math.max(MIN_SCALE, fitScale * 0.25);
+  }, []);
+
+  // ── Constrain a view ────────────────────────────────────────────────────────
+  // Allows panning drawing edges past viewport boundaries (generous margin) so
+  // users can comfortably read labels near drawing edges.
   const clampView = useCallback((v) => {
     const el = containerRef.current;
     const { w, h } = sizeRef.current;
@@ -54,25 +61,25 @@ export default function DrawingViewer({
     const ch = el.clientHeight;
     if (!cw || !ch) return v;
 
-    const fitScale = Math.max(cw / w, ch / h) * FIT_FILL;
-    const scale = clamp(v.scale, fitScale, MAX_SCALE);
+    const minScale = getMinScale();
+    const scale = clamp(v.scale, minScale, MAX_SCALE);
     const sw = w * scale;
     const sh = h * scale;
 
-    // If the drawing is smaller than the canvas on an axis, centre it (locked).
-    // Otherwise clamp so neither edge pulls inside the viewport.
-    const tx = sw <= cw ? (cw - sw) / 2 : clamp(v.tx, cw - sw, 0);
-    const ty = sh <= ch ? (ch - sh) / 2 : clamp(v.ty, ch - sh, 0);
+    const marginX = cw * 0.5;
+    const marginY = ch * 0.5;
+
+    const minTx = sw > cw ? cw - sw - marginX : -marginX;
+    const maxTx = sw > cw ? marginX : cw - sw + marginX;
+
+    const minTy = sh > ch ? ch - sh - marginY : -marginY;
+    const maxTy = sh > ch ? marginY : ch - sh + marginY;
+
+    const tx = clamp(v.tx, minTx, maxTx);
+    const ty = clamp(v.ty, minTy, maxTy);
 
     return { scale, tx, ty };
-  }, []);
-
-  const fitScaleNow = useCallback(() => {
-    const el = containerRef.current;
-    const { w, h } = sizeRef.current;
-    if (!el || !w || !h) return MIN_SCALE;
-    return Math.max(el.clientWidth / w, el.clientHeight / h) * FIT_FILL;
-  }, []);
+  }, [getMinScale]);
 
   // ── Fit a given drawing size into the canvas, centred ──────────────────────
   const fitWith = useCallback((w, h) => {
@@ -81,7 +88,7 @@ export default function DrawingViewer({
     const cw = el.clientWidth;
     const ch = el.clientHeight;
     if (!cw || !ch) return;
-    const scale = Math.max(cw / w, ch / h) * FIT_FILL;
+    const scale = Math.min(cw / w, ch / h) * FIT_FILL;
     setView(clampView({ scale, tx: (cw - w * scale) / 2, ty: (ch - h * scale) / 2 }));
   }, [clampView]);
 
@@ -122,7 +129,7 @@ export default function DrawingViewer({
   // ── Zoom toward a point (container-local px) ───────────────────────────────
   const zoomAt = useCallback((factor, cx, cy) => {
     setView((v) => {
-      const next = clamp(v.scale * factor, fitScaleNow(), MAX_SCALE);
+      const next = clamp(v.scale * factor, getMinScale(), MAX_SCALE);
       const k = next / v.scale;
       return clampView({
         scale: next,
@@ -130,7 +137,7 @@ export default function DrawingViewer({
         ty: cy - (cy - v.ty) * k,
       });
     });
-  }, [clampView, fitScaleNow]);
+  }, [clampView, getMinScale]);
 
   const zoomCenter = useCallback((factor) => {
     const el = containerRef.current;
@@ -138,14 +145,28 @@ export default function DrawingViewer({
     zoomAt(factor, el.clientWidth / 2, el.clientHeight / 2);
   }, [zoomAt]);
 
-  // ── Wheel = zoom to cursor ─────────────────────────────────────────────────
+  // ── Wheel = scroll/pan or zoom ─────────────────────────────────────────────
   const onWheel = useCallback((e) => {
     e.preventDefault();
     const el = containerRef.current;
     if (!el) return;
-    const rect = el.getBoundingClientRect();
-    zoomAt(e.deltaY > 0 ? 0.9 : 1.1, e.clientX - rect.left, e.clientY - rect.top);
-  }, [zoomAt]);
+
+    if (e.ctrlKey) {
+      // Zoom toward cursor (pinch gesture or ctrl+wheel)
+      const rect = el.getBoundingClientRect();
+      zoomAt(e.deltaY > 0 ? 0.9 : 1.1, e.clientX - rect.left, e.clientY - rect.top);
+    } else {
+      // Standard scrolling / panning
+      const dx = e.shiftKey ? e.deltaY : e.deltaX;
+      const dy = e.shiftKey ? 0 : e.deltaY;
+      
+      setView((v) => clampView({
+        ...v,
+        tx: v.tx - dx,
+        ty: v.ty - dy,
+      }));
+    }
+  }, [zoomAt, clampView]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -175,7 +196,14 @@ export default function DrawingViewer({
     }));
   }, [clampView]);
 
-  const endPan = useCallback(() => {
+  const endPan = useCallback((e) => {
+    if (e && containerRef.current?.hasPointerCapture?.(e.pointerId)) {
+      try {
+        containerRef.current.releasePointerCapture(e.pointerId);
+      } catch (err) {
+        // ignore if already released
+      }
+    }
     panRef.current.active = false;
     setIsPanning(false);
   }, []);
