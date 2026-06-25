@@ -24,11 +24,11 @@ popd
 echo.
 echo ============================================================
 echo   Stud Extraction is starting...
-echo   Open your browser at:  http://localhost:8000
+echo   Open your browser at:  http://localhost:8001
 echo   (Press Ctrl+C in this window to stop)
 echo ============================================================
 echo.
 
-start "" http://localhost:8000
-.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+start "" http://localhost:8001
+.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
 pause

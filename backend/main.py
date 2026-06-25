@@ -13,6 +13,7 @@ Endpoints:
 Run:  python -m uvicorn backend.main:app  (or just use run.bat)
 """
 
+import asyncio
 import hashlib
 import json
 import os
@@ -401,9 +402,9 @@ async def extract_endpoint(
 
     try:
         if page is not None:
-            result = extractor.extract_page(data, file.filename, page)
+            result = await asyncio.to_thread(extractor.extract_page, data, file.filename, page)
         else:
-            result = extractor.extract(data, file.filename)
+            result = await asyncio.to_thread(extractor.extract, data, file.filename)
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     except (ValueError, IndexError) as e:
@@ -416,6 +417,33 @@ async def extract_endpoint(
     return JSONResponse(result)
 
 
+@app.post("/api/extract_region")
+async def extract_region_endpoint(
+    file: UploadFile = File(...),
+    page: int = Query(0, ge=0),
+    x0: float = Query(...), y0: float = Query(...),
+    x1: float = Query(...), y1: float = Query(...),
+    user: dict = Depends(get_current_user),
+):
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_EXT:
+        raise HTTPException(400, f"Unsupported file type '{ext}'.")
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Empty file.")
+    if len(data) > MAX_BYTES:
+        raise HTTPException(413, "File too large (max 25 MB).")
+    try:
+        result = await asyncio.to_thread(extractor.extract_region, data, file.filename, page, x0, y0, x1, y1)
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+    except (ValueError, IndexError) as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Region extraction failed: {e}")
+    return JSONResponse(result)
+
+
 @app.post("/api/pagecount")
 async def pagecount_endpoint(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     data = await file.read()
@@ -423,9 +451,12 @@ async def pagecount_endpoint(file: UploadFile = File(...), user: dict = Depends(
     if name.endswith(".pdf") or data[:5] == b"%PDF-":
         try:
             import pypdfium2 as pdfium
-            pdf = pdfium.PdfDocument(data)
-            count = len(pdf)
-            pdf.close()
+            def _read_count():
+                doc = pdfium.PdfDocument(data)
+                count = len(doc)
+                doc.close()
+                return count
+            count = await asyncio.to_thread(_read_count)
             return {"page_count": count}
         except Exception:
             return {"page_count": 1}
@@ -445,7 +476,7 @@ async def preview_endpoint(
     if not data:
         raise HTTPException(400, "Empty file.")
     try:
-        png = extractor.render_preview(data, file.filename, page=page)
+        png = await asyncio.to_thread(extractor.render_preview, data, file.filename, page=page)
     except Exception as e:
         raise HTTPException(500, f"Could not render preview: {e}")
     return Response(content=png, media_type="image/png")
