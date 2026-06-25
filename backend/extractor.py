@@ -348,7 +348,8 @@ def _parse_ocr_data(data: dict, angle: int, orig_w: int, orig_h: int,
         sx, sy, sw, sh = data["left"][k], data["top"][k], data["width"][k], data["height"][k]
         if sw <= 0 or sh <= 0:
             continue
-        stud_cands.append((k, v, sx, sy + sh / 2))   # (token idx, value, left, centre-y)
+        # (token idx, value, left, centre-y, centre-x)
+        stud_cands.append((k, v, sx, sy + sh / 2, sx + sw / 2))
 
     claimed: set[int] = set()                 # stud token indices already used
 
@@ -365,6 +366,7 @@ def _parse_ocr_data(data: dict, angle: int, orig_w: int, orig_h: int,
 
         # Fast path: stud embedded in the same token (e.g. "W18X46[52]")
         stud = _parse_stud(data["text"][i])
+        stud_pt = None                       # the claimed stud's centre (tile-local)
 
         # Geometric search: nearest stud bracket within the tight window beside
         # this label.  No match → stud stays None → beam is dropped (correct for
@@ -373,7 +375,7 @@ def _parse_ocr_data(data: dict, angle: int, orig_w: int, orig_h: int,
             beam_right = x + w
             beam_cy = y + h / 2
             best = None
-            for (k, v, sx, scy) in stud_cands:
+            for (k, v, sx, scy, scx) in stud_cands:
                 if k == i:
                     continue
                 dx = (sx - beam_right) / w        # gap to the right, in label widths
@@ -384,18 +386,27 @@ def _parse_ocr_data(data: dict, angle: int, orig_w: int, orig_h: int,
                     continue
                 score = abs(dx) + abs(dy)
                 if best is None or score < best[0]:
-                    best = (score, v, k)
+                    best = (score, v, k, scx, scy)
             if best is not None:
                 stud = best[1]
                 claimed.add(best[2])
+                stud_pt = (best[3], best[4])
 
         fx, fy = x + x_offset, y + y_offset
         cx, cy = _map_center(fx, fy, w, h)
+        # Record the stud's position (falls back to the label centre when the
+        # stud was embedded in the same token) so orphans on the same stud can
+        # be deduped later.
+        if stud_pt is not None:
+            scx_o, scy_o = _map_center(stud_pt[0] + x_offset, stud_pt[1] + y_offset, 0, 0)
+        else:
+            scx_o, scy_o = cx, cy
 
         found.append({
             "cx": cx, "cy": cy,
             "section": section,
             "stud": stud,
+            "stud_cx": scx_o, "stud_cy": scy_o,
             "rot_x": fx, "rot_y": fy, "rot_w": w, "rot_h": h,
             "angle": angle,
         })
@@ -423,7 +434,7 @@ def _parse_ocr_data(data: dict, angle: int, orig_w: int, orig_h: int,
         wless.append((i, f"W{int(mm.group(1))}X{int(mm.group(2))}", x, y, w, h))
 
     used_beam: set[int] = set()
-    for (k, v, sx, scy) in stud_cands:
+    for (k, v, sx, scy, scx) in stud_cands:
         if k in claimed:
             continue
         best = None
@@ -446,10 +457,12 @@ def _parse_ocr_data(data: dict, angle: int, orig_w: int, orig_h: int,
         claimed.add(k)
         fx, fy = x + x_offset, y + y_offset
         cx, cy = _map_center(fx, fy, w, h)
+        scx_o, scy_o = _map_center(scx + x_offset, scy + y_offset, 0, 0)
         found.append({
             "cx": cx, "cy": cy,
             "section": section,
             "stud": v,
+            "stud_cx": scx_o, "stud_cy": scy_o,
             "rot_x": fx, "rot_y": fy, "rot_w": w, "rot_h": h,
             "angle": angle,
         })
@@ -457,7 +470,7 @@ def _parse_ocr_data(data: dict, angle: int, orig_w: int, orig_h: int,
     # Emit still-unclaimed stud brackets as ORPHANS (section unknown).  _detect_all
     # will zoom-OCR the label region to their left to recover the section.  These
     # carry the STUD's box so the zoom crop knows where to look.
-    for (k, v, sx, scy) in stud_cands:
+    for (k, v, sx, scy, scx) in stud_cands:
         if k in claimed:
             continue
         sxx, syy = data["left"][k], data["top"][k]
@@ -468,6 +481,7 @@ def _parse_ocr_data(data: dict, angle: int, orig_w: int, orig_h: int,
             "cx": cx, "cy": cy,
             "section": None,                 # orphan — label recovered later
             "stud": v,
+            "stud_cx": cx, "stud_cy": cy,    # orphan position IS the stud centre
             "rot_x": fx, "rot_y": fy, "rot_w": sww, "rot_h": shh,
             "angle": angle,
         })
@@ -487,16 +501,29 @@ def _scan_orientation(img: Image.Image, angle: int, orig_w: int, orig_h: int) ->
 
 
 # ---------------------------------------------------------------------------
-# Tiled scan — 2×2 quadrants with overlap, 0° only
-# Provides a "free zoom" into each quadrant to catch text missed in full view.
+# Tiled scan — 3×3 quadrants with overlap, each UPSCALED before OCR, 0° only.
+# Small labels/studs (~30 px tall in the full image) sit at Tesseract's
+# detection threshold, so the full-image and native-resolution tile passes miss
+# some.  Cropping into smaller tiles AND upscaling each ~2× lifts that text to a
+# comfortably readable size — this is what recovers the studs the coarse passes
+# drop (verified: a "W24X68 (51)" missed in full view reads cleanly when zoomed).
 # ---------------------------------------------------------------------------
-def _scan_tiled(img: Image.Image, orig_w: int, orig_h: int,
-                rows: int = 2, cols: int = 2, overlap: float = 0.12) -> list[dict]:
+TILE_UPSCALE = 2
+
+def _scan_tiled(img: Image.Image, orig_w: int, orig_h: int, angle: int = 0,
+                rows: int = 3, cols: int = 3, overlap: float = 0.12) -> list[dict]:
+    """
+    Upscaled tiled scan.  `angle` lets this run on rotated images too (90°/270°)
+    so VERTICAL beam labels — which only read in a rotated orientation — get the
+    same small-text recovery as upright ones.  `img` is the (possibly rotated)
+    image; `orig_w/orig_h` are the upright page dimensions for coordinate mapping.
+    """
     iw, ih = img.size
     tw = iw // cols
     th = ih // rows
     px = int(tw * overlap)
     py = int(th * overlap)
+    f = TILE_UPSCALE
 
     found = []
     for row in range(rows):
@@ -506,14 +533,39 @@ def _scan_tiled(img: Image.Image, orig_w: int, orig_h: int,
             x1 = min(iw, (col + 1) * tw + px)
             y1 = min(ih, (row + 1) * th + py)
             tile = img.crop((x0, y0, x1, y1))
+            if f != 1:
+                tile = tile.resize((tile.width * f, tile.height * f), Image.LANCZOS)
             data = pytesseract.image_to_data(
                 tile, config="--oem 3 --psm 11",
                 output_type=pytesseract.Output.DICT
             )
-            found += _parse_ocr_data(data, angle=0,
+            # Scale OCR coordinates back down from the upscaled tile space
+            if f != 1:
+                for k in ("left", "top", "width", "height"):
+                    data[k] = [v / f for v in data[k]]
+            found += _parse_ocr_data(data, angle=angle,
                                      orig_w=orig_w, orig_h=orig_h,
                                      x_offset=x0, y_offset=y0)
     return found
+
+
+# Words that appear only in a legend / key / notes block, never as framing
+# annotations.  Used to locate and exclude the sample beam drawn in a legend.
+_LEGEND_KEYWORDS = ("LEGEND", "SHEAR", "CAMBER", "DENOTES")
+
+
+def _legend_centers(img: Image.Image) -> list[tuple[float, float]]:
+    """Centres (original-image px) of legend/key indicator words on the page."""
+    data = pytesseract.image_to_data(
+        img, config="--oem 3 --psm 11", output_type=pytesseract.Output.DICT
+    )
+    pts = []
+    for i in range(len(data["text"])):
+        t = data["text"][i].upper()
+        if any(k in t for k in _LEGEND_KEYWORDS):
+            pts.append((data["left"][i] + data["width"][i] / 2,
+                        data["top"][i] + data["height"][i] / 2))
+    return pts
 
 
 # ---------------------------------------------------------------------------
@@ -526,10 +578,11 @@ def _detect_all(gray: Image.Image) -> list[dict]:
     rot270 = gray.rotate(270, expand=True)
     rot_imgs = {0: gray, 90: rot90, 270: rot270}
 
-    # Full-image PSM 11 on three orientations + tiled PSM 11 on the upright image
+    # Full-image PSM 11 on three orientations + UPSCALED tiled PSM 11 on the
+    # upright image.
     detections = (
         _scan_orientation(gray,   0,   ow, oh)
-        + _scan_tiled(gray, ow, oh)               # 4 quadrant passes on 0°
+        + _scan_tiled(gray,   ow, oh, angle=0)
         + _scan_orientation(rot90,  90,  ow, oh)
         + _scan_orientation(rot270, 270, ow, oh)
     )
@@ -565,6 +618,36 @@ def _detect_all(gray: Image.Image) -> list[dict]:
     beams   = [d for d in kept if d["section"] is not None]
     orphans = [d for d in kept if d["section"] is None]
 
+    # ── Cross-pass label↔stud pairing ──────────────────────────────────────
+    # Pairing inside _parse_ocr_data only sees one OCR pass at a time.  A beam's
+    # LABEL can be detected in one pass while its STUD is detected (as an orphan)
+    # in another — both pieces exist but were never connected, so the beam was
+    # dropped.  This is the systematic "few missed on every clean drawing" cause.
+    # Here we connect them GLOBALLY using the same tight geometric window (in the
+    # detection's own orientation space, where the stud sits just right of the
+    # label on the same row).  Uses already-read tokens, so it's exact.
+    used_orphans: set[int] = set()
+    for d in beams:
+        if d["stud"] is not None:
+            continue
+        b_right = d["rot_x"] + d["rot_w"]
+        b_cy = d["rot_y"] + d["rot_h"] / 2
+        best = None
+        for oi, o in enumerate(orphans):
+            if oi in used_orphans or o["angle"] != d["angle"]:
+                continue
+            dx = (o["rot_x"] - b_right) / d["rot_w"]
+            dy = (o["rot_y"] + o["rot_h"] / 2 - b_cy) / d["rot_h"]
+            if dx < STUD_DX_MIN or dx > STUD_DX_MAX or abs(dy) > STUD_DY_MAX:
+                continue
+            score = abs(dx) + abs(dy)
+            if best is None or score < best[0]:
+                best = (score, oi, o["stud"])
+        if best is not None:
+            d["stud"] = best[2]
+            used_orphans.add(best[1])
+    orphans = [o for i, o in enumerate(orphans) if i not in used_orphans]
+
     # For rotated detections: re-OCR the upright crop for better stud accuracy
     for d in beams:
         if d["angle"] != 0 and d["stud"] is None:
@@ -585,11 +668,19 @@ def _detect_all(gray: Image.Image) -> list[dict]:
             )
 
     # Orphan-stud recovery: a stud bracket that belongs to no detected beam.
-    # If it isn't co-located with a beam we already have, zoom-OCR the label
-    # region to its left to recover the section (handles dropped W/X, merged
-    # digits, line-crossing clutter).  This is what rescues the last 1–2 misses.
+    # Recover its section by zooming the label region to its left (handles
+    # dropped W/X, merged digits, line-crossing clutter).  This rescues the
+    # last 1–2 misses.
+    #
+    # CRITICAL dedup: an orphan is skipped if its stud position coincides with a
+    # stud ALREADY claimed by a beam.  A stud claimed in one pass can be left
+    # unclaimed in another (tiled/rotated); without this check it would be
+    # re-recovered as a DUPLICATE beam (offset from the original because the beam
+    # sits at the label, the orphan at the stud).  Comparing stud-centre to
+    # stud-centre catches it cleanly.
     for o in orphans:
-        if any(abs(o["cx"] - b["cx"]) < DEDUP_RADIUS and abs(o["cy"] - b["cy"]) < DEDUP_RADIUS
+        if any(abs(o["cx"] - b["stud_cx"]) < DEDUP_RADIUS
+               and abs(o["cy"] - b["stud_cy"]) < DEDUP_RADIUS
                for b in beams):
             continue
         section = _zoom_read_label(
@@ -602,6 +693,21 @@ def _detect_all(gray: Image.Image) -> list[dict]:
     # Only keep beams with a confirmed section AND stud value
     kept = [d for d in beams if d["section"] is not None and d["stud"] is not None]
 
+    # Drop the sample beam drawn inside a STEEL BEAM LEGEND / key.  Legend-only
+    # words (LEGEND, SHEAR STUDS, CAMBER, DENOTES) never appear among real
+    # framing annotations, so any beam sitting near one is a legend example.
+    legend_pts = _legend_centers(gray)
+    if legend_pts:
+        R = 0.07 * max(ow, oh)
+        before = len(kept)
+        kept = [
+            d for d in kept
+            if not any(abs(d["cx"] - lx) < R and abs(d["cy"] - ly) < R
+                       for (lx, ly) in legend_pts)
+        ]
+        if before != len(kept):
+            print(f"  Excluded {before - len(kept)} legend-area detection(s)", file=sys.stderr)
+
     # Sort top-to-bottom, left-to-right for consistent output
     kept.sort(key=lambda d: (round(d["cy"] / 50), d["cx"]))
 
@@ -609,10 +715,54 @@ def _detect_all(gray: Image.Image) -> list[dict]:
 
     # Strip internal fields before returning
     for d in kept:
-        for k in ("rot_x", "rot_y", "rot_w", "rot_h", "angle"):
+        for k in ("rot_x", "rot_y", "rot_w", "rot_h", "angle", "stud_cx", "stud_cy"):
             d.pop(k, None)
 
     return kept
+
+
+# ---------------------------------------------------------------------------
+# Outlier stud correction — fix rare OCR digit misreads (e.g. [52] read as 92)
+# ---------------------------------------------------------------------------
+# Look-alike digit pairs Tesseract swaps when a glyph is degraded or upscaled.
+_CONFUSABLE_DIGITS = {
+    frozenset("59"), frozenset("56"), frozenset("38"), frozenset("08"),
+    frozenset("17"), frozenset("58"), frozenset("06"), frozenset("69"),
+    frozenset("13"), frozenset("35"), frozenset("89"), frozenset("01"),
+}
+
+
+def _one_confusable_digit_apart(a: int, b: int) -> bool:
+    sa, sb = str(a), str(b)
+    if len(sa) != len(sb):
+        return False
+    diffs = [(x, y) for x, y in zip(sa, sb) if x != y]
+    return len(diffs) == 1 and frozenset(diffs[0]) in _CONFUSABLE_DIGITS
+
+
+def _correct_outlier_studs(results: list[dict]) -> None:
+    """
+    Snap a rare stud-value outlier to its section's dominant value when the two
+    differ by a single look-alike digit — e.g. one W18X46[92] among many
+    W18X46[52] is a misread of [52].  Conservative: the dominant value must be
+    ≥4× and ≥4× as common as the outlier, and the outlier must appear ≤2×, so
+    legitimate secondary values are never touched.
+    """
+    from collections import Counter
+    by_sec: dict[str, list[dict]] = {}
+    for r in results:
+        if isinstance(r["stud_value"], int):
+            by_sec.setdefault(r["beam_section"], []).append(r)
+    for items in by_sec.values():
+        counts = Counter(r["stud_value"] for r in items)
+        mode, mode_n = counts.most_common(1)[0]
+        if mode_n < 4:
+            continue
+        for r in items:
+            v = r["stud_value"]
+            if v != mode and counts[v] <= 2 and mode_n >= 4 * counts[v] \
+                    and _one_confusable_digit_apart(v, mode):
+                r["stud_value"] = mode
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +820,7 @@ def extract(data: bytes, filename: str) -> dict:
             page_results.append(entry)
             all_results.append(entry)
 
+        _correct_outlier_studs(page_results)
         page_data.append({
             "page":       page_idx,
             "ocr_width":  pw,
@@ -715,6 +866,7 @@ def extract_page(data: bytes, filename: str, page_idx: int) -> dict:
             "cx": round(d["cx"] / pw, 5),
             "cy": round(d["cy"] / ph, 5),
         })
+    _correct_outlier_studs(page_results)
 
     return {
         "filename":   filename,
@@ -724,6 +876,68 @@ def extract_page(data: bytes, filename: str, page_idx: int) -> dict:
         "ocr_height": ph,
         "results":    page_results,
         "summary":    build_summary(page_results),
+    }
+
+
+def extract_region(data: bytes, filename: str, page_idx: int,
+                   rx0: float, ry0: float, rx1: float, ry1: float) -> dict:
+    """
+    Thoroughly extract every beam inside a user-selected region.
+
+    The region (normalised 0-1 page coordinates) is cropped from the full-res
+    page and UPSCALED before running the full detection pipeline — a small crop
+    means the small stud/label text becomes large enough for OCR to read
+    reliably, recovering beams the whole-page pass misses.  Returned coordinates
+    are mapped back to full-page normalised space so they overlay correctly.
+    """
+    if not _TESS:
+        raise RuntimeError("Tesseract OCR not found.")
+
+    raw_pages = _load_pages(data, filename)
+    total = len(raw_pages)
+    if page_idx >= total:
+        raise ValueError(f"Page {page_idx} out of range (doc has {total} pages)")
+
+    page = raw_pages[page_idx]
+    pw, ph = page.size
+
+    # Normalise/clamp the region box
+    rx0, rx1 = sorted((max(0.0, min(1.0, rx0)), max(0.0, min(1.0, rx1))))
+    ry0, ry1 = sorted((max(0.0, min(1.0, ry0)), max(0.0, min(1.0, ry1))))
+    px0, py0 = int(rx0 * pw), int(ry0 * ph)
+    px1, py1 = int(rx1 * pw), int(ry1 * ph)
+    if px1 - px0 < 20 or py1 - py0 < 20:
+        raise ValueError("Selected region is too small.")
+
+    crop = page.crop((px0, py0, px1, py1))
+
+    # Upscale the crop so its text is comfortably readable.  Bigger upscale for
+    # smaller selections (where you most want fine detail); capped for memory.
+    longest = max(crop.size)
+    f = 3 if longest < 2500 else (2 if longest < 5000 else 1)
+    big = crop.resize((crop.width * f, crop.height * f), Image.LANCZOS) if f != 1 else crop
+
+    print(f"Region extract p{page_idx+1}: crop {crop.size} upscaled x{f} -> {big.size}", file=sys.stderr)
+
+    results = []
+    for d in _detect_all(big):
+        # big -> crop -> full page -> normalised
+        fx = px0 + d["cx"] / f
+        fy = py0 + d["cy"] / f
+        results.append({
+            "beam_section": d["section"],
+            "stud_value":   d["stud"],
+            "cx": round(fx / pw, 5),
+            "cy": round(fy / ph, 5),
+        })
+
+    return {
+        "filename":   filename,
+        "page":       page_idx,
+        "ocr_width":  pw,
+        "ocr_height": ph,
+        "region":     [rx0, ry0, rx1, ry1],
+        "results":    results,
     }
 
 

@@ -7,7 +7,21 @@ import ResultsTable from "./components/ResultsTable.jsx";
 import LoginView from "./components/LoginView.jsx";
 import HistoryView from "./components/HistoryView.jsx";
 import UserManagementView from "./components/UserManagementView.jsx";
-import { getHealth, previewFile, extractFile, getPageCount, getCurrentUser, logout } from "./api.js";
+import { getHealth, previewFile, extractFile, extractRegion, getPageCount, getCurrentUser, logout } from "./api.js";
+
+// Recompute summary client-side after merging region results.
+function buildSummaryClient(results) {
+  const groups = {};
+  let totalStuds = 0;
+  for (const r of results) {
+    const g = groups[r.beam_section] ?? (groups[r.beam_section] = { section: r.beam_section, count: 0, stud_total: 0, instances: [] });
+    g.count += 1;
+    g.instances.push(r.stud_value);
+    if (typeof r.stud_value === "number") { g.stud_total += r.stud_value; totalStuds += r.stud_value; }
+  }
+  const sections = Object.values(groups).sort((a, b) => a.section.localeCompare(b.section));
+  return { total_beams: results.length, total_studs: totalStuds, total_sections: sections.length, sections };
+}
 
 export default function App() {
   const [engine, setEngine]           = useState(null);
@@ -91,12 +105,55 @@ export default function App() {
     setTotalPages(1);
   }
 
-  // Extract only the current page
+  // The region the user has drawn (normalised 0-1), or null for full page.
+  const [regionSel, setRegionSel] = useState(null);
+
+  // Extract the current page — OR, if a region is selected, just that region
+  // (merged into existing results).  Same button, scoped smaller.
   async function handleExtract() {
     if (!file) return;
     const pg = currentPage;
     setPageStatus((prev) => ({ ...prev, [pg]: "working" }));
     setError(null);
+
+    // Region mode: crop + thorough extract, MERGE into existing results.
+    if (regionSel) {
+      try {
+        const result = await extractRegion(file, pg, regionSel);
+        setPagesData((prev) => {
+          const existing = prev[pg]?.results ?? [];
+          const merged = [...existing];
+          // A region beam landing on an existing detection is the SAME physical
+          // beam (the region pass may shift its position slightly or misread a
+          // digit, e.g. 56→66).  Treat anything co-located as a duplicate and
+          // keep the original.  Beams are ~0.08 apart, so 0.018 is safe.
+          const DUP = 0.018;
+          for (const nb of result.results) {
+            const dup = merged.some(
+              (e) => Math.abs(e.cx - nb.cx) < DUP && Math.abs(e.cy - nb.cy) < DUP
+            );
+            if (!dup) merged.push(nb);
+          }
+          return {
+            ...prev,
+            [pg]: {
+              results:    merged,
+              ocr_width:  result.ocr_width  ?? prev[pg]?.ocr_width,
+              ocr_height: result.ocr_height ?? prev[pg]?.ocr_height,
+              summary:    buildSummaryClient(merged),
+            },
+          };
+        });
+        setPageStatus((prev) => ({ ...prev, [pg]: "done" }));
+        setRegionSel(null);   // clear the box once extracted
+      } catch (e) {
+        setError(e.message);
+        setPageStatus((prev) => ({ ...prev, [pg]: "error" }));
+      }
+      return;
+    }
+
+    // Full-page extraction (replaces results)
     try {
       const result = await extractFile(file, pg);
       setPagesData((prev) => ({
@@ -116,6 +173,7 @@ export default function App() {
   }
 
   async function handlePageChange(newPage) {
+    setRegionSel(null);
     setCurrentPage(newPage);
     fetchPreview(file, newPage);
   }
@@ -191,6 +249,7 @@ export default function App() {
           onPageChange={handlePageChange}
           onExtract={handleExtract}
           onReset={handleReset}
+          hasRegion={!!regionSel}
           activeTab={activeTab}
           onTabChange={setActiveTab}
           currentUser={currentUser}
@@ -215,6 +274,8 @@ export default function App() {
                 currentPage={currentPage}
                 pageCount={totalPages}
                 onPageChange={handlePageChange}
+                regionSel={regionSel}
+                onRegionSelect={setRegionSel}
               />
               {curStatus === "done" && pageData?.results?.length > 0 && (
                 <div className="results-section">

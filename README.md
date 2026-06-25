@@ -39,7 +39,7 @@ Stud EXtraction/
 
 2. **Double-click `run.bat`.**
    The first run sets up Python, installs packages, builds the frontend, then
-   opens your browser at **http://localhost:8000**. Later runs start instantly.
+   opens your browser at **http://localhost:8001**. Later runs start instantly.
 
 3. To stop the app, press **Ctrl + C** in the black window.
 
@@ -97,9 +97,9 @@ Run two terminals:
 
 ```
 # terminal 1 — backend
-.venv\Scripts\python.exe -m uvicorn backend.main:app --reload --port 8000
+.venv\Scripts\python.exe -m uvicorn backend.main:app --reload --port 8001
 
-# terminal 2 — frontend (hot reload, proxies /api to :8000)
+# terminal 2 — frontend (hot reload, proxies /api to :8001)
 cd frontend
 npm run dev
 ```

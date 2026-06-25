@@ -67,7 +67,7 @@ function PageStatusGlyph({ status }) {
 export default function Sidebar({
   fileName, status, summary,
   pageCount, currentPage, pageStatus,
-  onPageChange, onExtract, onReset,
+  onPageChange, onExtract, onReset, hasRegion,
   activeTab, onTabChange, currentUser
 }) {
   const s        = summary || { total_beams: 0, total_studs: 0, total_sections: 0, sections: [] };
@@ -114,11 +114,11 @@ export default function Sidebar({
           disabled={!fileName || working || activeTab !== "workspace"}
         >
           {working ? (
-            <span>EXTRACTING PG {padNum(currentPage + 1)}...</span>
+            <span>EXTRACTING{hasRegion ? " REGION" : ` PG ${padNum(currentPage + 1)}`}...</span>
           ) : (
             <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}>
               <Play size={12} fill="currentColor" />
-              RUN EXTRACTION · PG {padNum(currentPage + 1)}
+              {hasRegion ? "EXTRACT REGION" : `RUN EXTRACTION · PG ${padNum(currentPage + 1)}`}
             </span>
           )}
         </button>

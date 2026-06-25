@@ -1080,6 +1080,55 @@ h3 { font-size: 13px; }
 /* Hand tool cursor */
 .viewer-canvas.pannable { cursor: grab; }
 .viewer-canvas.grabbing { cursor: grabbing; }
+.viewer-canvas.region-mode { cursor: crosshair; }
+
+/* Region selection rectangle */
+.region-sel {
+  position: absolute;
+  z-index: 6;
+  border: 2px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  pointer-events: none;
+}
+
+/* Selected region: a small caption sits above the box */
+.region-pending { pointer-events: none; }
+
+.region-tag {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  margin-bottom: 5px;
+  white-space: nowrap;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  color: var(--bg-0);
+  background: var(--accent);
+  padding: 3px 8px;
+  border-radius: 2px;
+}
+
+/* Region mode hint / busy banner */
+.region-banner {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 7;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--bg-0);
+  background: var(--accent);
+  border-radius: 3px;
+  padding: 6px 12px;
+  pointer-events: none;
+}
+.region-banner.region-busy {
+  background: var(--info);
+}
 
 /* Empty / historical states sit dead-centre regardless of transforms */
 .viewer-canvas > .viewer-loading {

@@ -61,6 +61,20 @@ export async function extractFile(file, page = null) {
   return r.json();
 }
 
+// Extract every beam inside a selected region (normalised 0-1 page coords).
+export async function extractRegion(file, page, region) {
+  const form = new FormData();
+  form.append("file", file);
+  const { x0, y0, x1, y1 } = region;
+  const url = `/calstud/api/extract_region?page=${page}&x0=${x0}&y0=${y0}&x1=${x1}&y1=${y1}`;
+  const r = await fetch(url, { method: "POST", body: form, headers: getHeaders() });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(err.detail || "Region extraction failed");
+  }
+  return r.json();
+}
+
 // --- Authentication Operations ---
 
 export async function login(username, password) {
