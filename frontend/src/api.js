@@ -11,7 +11,7 @@ function getHeaders(isJson = false) {
 }
 
 export async function getHealth() {
-  const r = await fetch("/calstud/api/health", { headers: getHeaders() });
+  const r = await fetch("/api/health", { headers: getHeaders() });
   if (!r.ok) throw new Error("Backend offline");
   return r.json();
 }
@@ -19,7 +19,7 @@ export async function getHealth() {
 export async function getPageCount(file) {
   const form = new FormData();
   form.append("file", file);
-  const r = await fetch("/calstud/api/pagecount", { 
+  const r = await fetch("/api/pagecount", { 
     method: "POST", 
     body: form,
     headers: getHeaders()
@@ -32,7 +32,7 @@ export async function getPageCount(file) {
 export async function previewFile(file, page = 0) {
   const form = new FormData();
   form.append("file", file);
-  const r = await fetch(`/calstud/api/preview?page=${page}`, { 
+  const r = await fetch(`/api/preview?page=${page}`, { 
     method: "POST", 
     body: form,
     headers: getHeaders()
@@ -48,7 +48,7 @@ export async function previewFile(file, page = 0) {
 export async function extractFile(file, page = null) {
   const form = new FormData();
   form.append("file", file);
-  const url = page !== null ? `/calstud/api/extract?page=${page}` : "/calstud/api/extract";
+  const url = page !== null ? `/api/extract?page=${page}` : "/api/extract";
   const r = await fetch(url, { 
     method: "POST", 
     body: form,
@@ -66,7 +66,7 @@ export async function extractRegion(file, page, region) {
   const form = new FormData();
   form.append("file", file);
   const { x0, y0, x1, y1 } = region;
-  const url = `/calstud/api/extract_region?page=${page}&x0=${x0}&y0=${y0}&x1=${x1}&y1=${y1}`;
+  const url = `/api/extract_region?page=${page}&x0=${x0}&y0=${y0}&x1=${x1}&y1=${y1}`;
   const r = await fetch(url, { method: "POST", body: form, headers: getHeaders() });
   if (!r.ok) {
     const err = await r.json().catch(() => ({ detail: r.statusText }));
@@ -78,7 +78,7 @@ export async function extractRegion(file, page, region) {
 // --- Authentication Operations ---
 
 export async function login(username, password) {
-  const r = await fetch("/calstud/api/auth/login", {
+  const r = await fetch("/api/auth/login", {
     method: "POST",
     headers: getHeaders(true),
     body: JSON.stringify({ username, password })
@@ -93,7 +93,7 @@ export async function login(username, password) {
 }
 
 export async function register(username, password) {
-  const r = await fetch("/calstud/api/auth/register", {
+  const r = await fetch("/api/auth/register", {
     method: "POST",
     headers: getHeaders(true),
     body: JSON.stringify({ username, password })
@@ -107,7 +107,7 @@ export async function register(username, password) {
 
 export async function logout() {
   try {
-    await fetch("/calstud/api/auth/logout", {
+    await fetch("/api/auth/logout", {
       method: "POST",
       headers: getHeaders()
     });
@@ -120,7 +120,7 @@ export async function logout() {
 export async function getCurrentUser() {
   const token = localStorage.getItem("token");
   if (!token) return null;
-  const r = await fetch("/calstud/api/auth/me", { headers: getHeaders() });
+  const r = await fetch("/api/auth/me", { headers: getHeaders() });
   if (!r.ok) {
     localStorage.removeItem("token");
     return null;
@@ -131,7 +131,7 @@ export async function getCurrentUser() {
 // --- History Operations ---
 
 export async function getHistory() {
-  const r = await fetch("/calstud/api/history", { headers: getHeaders() });
+  const r = await fetch("/api/history", { headers: getHeaders() });
   if (!r.ok) {
     throw new Error("Failed to load history");
   }
@@ -139,7 +139,7 @@ export async function getHistory() {
 }
 
 export async function getHistoryItem(id) {
-  const r = await fetch(`/calstud/api/history/${id}`, { headers: getHeaders() });
+  const r = await fetch(`/api/history/${id}`, { headers: getHeaders() });
   if (!r.ok) {
     throw new Error("Failed to load history item");
   }
@@ -147,7 +147,7 @@ export async function getHistoryItem(id) {
 }
 
 export async function deleteHistoryItem(id) {
-  const r = await fetch(`/calstud/api/history/${id}`, { 
+  const r = await fetch(`/api/history/${id}`, { 
     method: "DELETE",
     headers: getHeaders() 
   });
@@ -161,7 +161,7 @@ export async function deleteHistoryItem(id) {
 // --- User Management Operations ---
 
 export async function getUsers() {
-  const r = await fetch("/calstud/api/users", { headers: getHeaders() });
+  const r = await fetch("/api/users", { headers: getHeaders() });
   if (!r.ok) {
     throw new Error("Failed to load user list");
   }
@@ -169,7 +169,7 @@ export async function getUsers() {
 }
 
 export async function createUser(username, password, role) {
-  const r = await fetch("/calstud/api/users", {
+  const r = await fetch("/api/users", {
     method: "POST",
     headers: getHeaders(true),
     body: JSON.stringify({ username, password, role })
@@ -182,7 +182,7 @@ export async function createUser(username, password, role) {
 }
 
 export async function deleteUser(id) {
-  const r = await fetch(`/calstud/api/users/${id}`, {
+  const r = await fetch(`/api/users/${id}`, {
     method: "DELETE",
     headers: getHeaders()
   });
@@ -198,7 +198,7 @@ export async function updateUser(id, password, role) {
   if (password) payload.password = password;
   if (role) payload.role = role;
 
-  const r = await fetch(`/calstud/api/users/${id}`, {
+  const r = await fetch(`/api/users/${id}`, {
     method: "PUT",
     headers: getHeaders(true),
     body: JSON.stringify(payload)
