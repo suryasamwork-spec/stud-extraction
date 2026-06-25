@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback, useLayoutEffect } from "react";
 import {
   ZoomIn, ZoomOut, Maximize, ChevronLeft, ChevronRight, Info,
-  Hand, Scan, Plus, Minus,
+  Hand, Scan, Plus, Minus, BoxSelect,
 } from "lucide-react";
 
 const SECTION_COLORS = [
@@ -25,7 +25,7 @@ const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
 export default function DrawingViewer({
   url, fileName, status, error, results, ocrW, ocrH,
-  currentPage, pageCount, onPageChange,
+  currentPage, pageCount, onPageChange, regionSel, onRegionSelect,
 }) {
   const containerRef = useRef(null);
   const imgRef       = useRef(null);
@@ -33,6 +33,13 @@ export default function DrawingViewer({
   const [imgSize, setImgSize] = useState({ w: 0, h: 0 });
   const [view, setView]       = useState({ scale: 1, tx: 0, ty: 0 });
   const [isPanning, setIsPanning] = useState(false);
+
+  // Region-select tool: when active, dragging draws a box.  On release the box
+  // becomes the selected region (regionSel, lifted to App) and stays visible —
+  // the user then clicks the normal RUN EXTRACTION button to extract just it.
+  const [regionMode, setRegionMode] = useState(false);
+  const [selRect, setSelRect]       = useState(null);       // live drag box, container px
+  const selRef = useRef({ active: false, sx: 0, sy: 0 });
 
   const panRef  = useRef({ active: false, startX: 0, startY: 0, baseTx: 0, baseTy: 0 });
   const viewRef = useRef(view);
@@ -175,18 +182,53 @@ export default function DrawingViewer({
     return () => el.removeEventListener("wheel", onWheel);
   }, [onWheel]);
 
-  // ── Hand / drag panning ────────────────────────────────────────────────────
+  // Convert a container-local point to normalised page coordinates (0-1)
+  const toNorm = useCallback((px, py) => {
+    const v = viewRef.current;
+    const { w, h } = sizeRef.current;
+    if (!w || !h) return { x: 0, y: 0 };
+    return {
+      x: clamp((px - v.tx) / v.scale / w, 0, 1),
+      y: clamp((py - v.ty) / v.scale / h, 0, 1),
+    };
+  }, []);
+
+  // Keep a live ref of regionMode so the move handler always sees the current value
+  const regionModeRef = useRef(regionMode);
+  regionModeRef.current = regionMode;
+
+  // ── Pointer handlers: pan, OR draw a selection box in region mode ──────────
   const onPointerDown = useCallback((e) => {
     if (e.button !== 0 && e.button !== 1) return;
-    containerRef.current?.setPointerCapture?.(e.pointerId);
+    e.preventDefault();                       // stop native image-drag / text-select
+    const el = containerRef.current;
+    el?.setPointerCapture?.(e.pointerId);
+    const rect = el.getBoundingClientRect();
+    if (regionMode) {
+      const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+      selRef.current = { active: true, sx, sy };
+      panRef.current.active = false;          // never pan while selecting
+      onRegionSelect?.(null);
+      setSelRect({ x0: sx, y0: sy, x1: sx, y1: sy });
+      return;
+    }
     panRef.current = {
       active: true, startX: e.clientX, startY: e.clientY,
       baseTx: viewRef.current.tx, baseTy: viewRef.current.ty,
     };
     setIsPanning(true);
-  }, []);
+  }, [regionMode]);
 
   const onPointerMove = useCallback((e) => {
+    if (selRef.current.active) {
+      const rect = containerRef.current.getBoundingClientRect();
+      setSelRect({
+        x0: selRef.current.sx, y0: selRef.current.sy,
+        x1: e.clientX - rect.left, y1: e.clientY - rect.top,
+      });
+      return;
+    }
+    if (regionModeRef.current) return;        // region mode never pans
     const p = panRef.current;
     if (!p.active) return;
     setView((v) => clampView({
@@ -198,15 +240,37 @@ export default function DrawingViewer({
 
   const endPan = useCallback((e) => {
     if (e && containerRef.current?.hasPointerCapture?.(e.pointerId)) {
-      try {
-        containerRef.current.releasePointerCapture(e.pointerId);
-      } catch (err) {
-        // ignore if already released
+      try { containerRef.current.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    }
+    if (selRef.current.active) {
+      selRef.current.active = false;
+      const r = selRect;
+      setSelRect(null);
+      // Box drawn → set it as the selected region (stays visible).  The user then
+      // clicks RUN EXTRACTION.  Too-small boxes are treated as a misclick.
+      if (r && Math.abs(r.x1 - r.x0) > 8 && Math.abs(r.y1 - r.y0) > 8) {
+        const a = toNorm(r.x0, r.y0), b = toNorm(r.x1, r.y1);
+        onRegionSelect?.({
+          x0: Math.min(a.x, b.x), y0: Math.min(a.y, b.y),
+          x1: Math.max(a.x, b.x), y1: Math.max(a.y, b.y),
+        });
       }
+      return;
     }
     panRef.current.active = false;
     setIsPanning(false);
-  }, []);
+  }, [selRect, toNorm, onRegionSelect]);
+
+  // Box (container px) for the selected region, derived from the live view transform
+  const pendingBox = regionSel ? (() => {
+    const v = view, { w, h } = imgSize;
+    return {
+      left:   regionSel.x0 * w * v.scale + v.tx,
+      top:    regionSel.y0 * h * v.scale + v.ty,
+      width:  (regionSel.x1 - regionSel.x0) * w * v.scale,
+      height: (regionSel.y1 - regionSel.y0) * h * v.scale,
+    };
+  })() : null;
 
   const onDoubleClick = useCallback((e) => {
     const rect = containerRef.current.getBoundingClientRect();
@@ -257,19 +321,22 @@ export default function DrawingViewer({
       {/* Canvas */}
       <div
         ref={containerRef}
-        className={`viewer-canvas${hasImg ? " pannable" : ""}${isPanning ? " grabbing" : ""}`}
+        className={`viewer-canvas${hasImg ? " pannable" : ""}${isPanning ? " grabbing" : ""}${regionMode ? " region-mode" : ""}`}
         onPointerDown={hasImg ? onPointerDown : undefined}
         onPointerMove={hasImg ? onPointerMove : undefined}
         onPointerUp={endPan}
         onPointerLeave={endPan}
         onPointerCancel={endPan}
-        onDoubleClick={hasImg ? onDoubleClick : undefined}
+        onDoubleClick={hasImg && !regionMode ? onDoubleClick : undefined}
       >
         {/* Left vertical tool palette */}
         {hasImg && (
           <div className="viewer-rail" onPointerDown={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
-            <button className="rail-btn rail-active" aria-label="Pan / hand tool" title="Pan (drag the drawing)">
+            <button className={`rail-btn${!regionMode ? " rail-active" : ""}`} onClick={() => { setRegionMode(false); onRegionSelect?.(null); }} aria-label="Pan / hand tool" title="Pan (drag the drawing)">
               <Hand size={16} />
+            </button>
+            <button className={`rail-btn${regionMode ? " rail-active" : ""}`} onClick={() => setRegionMode((m) => !m)} aria-label="Select region to extract" title="Select a region, then click Run Extraction">
+              <BoxSelect size={16} />
             </button>
             <div className="rail-sep" />
             <button className="rail-btn" onClick={() => zoomCenter(1.25)} aria-label="Zoom in" title="Zoom in">
@@ -286,6 +353,37 @@ export default function DrawingViewer({
               <Scan size={15} />
             </button>
           </div>
+        )}
+
+        {/* Live selection rectangle while dragging */}
+        {selRect && (
+          <div
+            className="region-sel"
+            style={{
+              left:   Math.min(selRect.x0, selRect.x1),
+              top:    Math.min(selRect.y0, selRect.y1),
+              width:  Math.abs(selRect.x1 - selRect.x0),
+              height: Math.abs(selRect.y1 - selRect.y0),
+            }}
+          />
+        )}
+
+        {/* Selected region box — stays visible; extracted via RUN EXTRACTION */}
+        {pendingBox && (
+          <div
+            className="region-sel region-pending"
+            style={{ left: pendingBox.left, top: pendingBox.top, width: pendingBox.width, height: pendingBox.height }}
+          >
+            <div className="region-tag t-mono">REGION SELECTED — CLICK RUN EXTRACTION</div>
+          </div>
+        )}
+
+        {/* Region-mode hint */}
+        {regionMode && !selRect && !regionSel && (
+          <div className="region-banner t-mono"><BoxSelect size={13} /> DRAG A BOX OVER THE BEAMS</div>
+        )}
+        {working && (
+          <div className="region-banner region-busy t-mono">EXTRACTING…</div>
         )}
 
         {url ? (

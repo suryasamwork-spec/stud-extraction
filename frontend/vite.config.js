@@ -2,7 +2,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 // Build output goes to dist/, which the FastAPI backend serves in production.
-// During `npm run dev`, /api calls are proxied to the FastAPI server on :8000.
+// During `npm run dev`, /api calls are proxied to the FastAPI server on :8001.
 export default defineConfig({
   plugins: [react()],
   build: {
@@ -12,7 +12,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": "http://127.0.0.1:8000",
+      "/api": "http://127.0.0.1:8001",
     },
   },
 });
