@@ -18,7 +18,11 @@ import io
 import os
 import re
 import sys
-import winreg
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
 
 import pytesseract
 from PIL import Image, ImageFilter, ImageOps
@@ -29,22 +33,23 @@ import pypdfium2 as pdfium
 # Locate Tesseract
 # ---------------------------------------------------------------------------
 def _find_tesseract() -> str | None:
-    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-        try:
-            with winreg.OpenKey(hive, r"SOFTWARE\Tesseract-OCR") as k:
-                path, _ = winreg.QueryValueEx(k, "InstallDir")
-                exe = os.path.join(path, "tesseract.exe")
-                if os.path.isfile(exe):
-                    return exe
-        except OSError:
-            pass
-    for c in [
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
-    ]:
-        if os.path.isfile(c):
-            return c
+    if winreg is not None:
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(hive, r"SOFTWARE\Tesseract-OCR") as k:
+                    path, _ = winreg.QueryValueEx(k, "InstallDir")
+                    exe = os.path.join(path, "tesseract.exe")
+                    if os.path.isfile(exe):
+                        return exe
+            except OSError:
+                pass
+        for c in [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+        ]:
+            if os.path.isfile(c):
+                return c
     from shutil import which
     return which("tesseract")
 
